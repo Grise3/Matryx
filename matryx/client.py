@@ -3,13 +3,14 @@ import json
 import logging
 import aiohttp
 import time
-from typing import Dict, List, Optional, Callable, Any, Union, BinaryIO, Tuple
-from urllib.parse import urljoin, urlparse
-
+import mimetypes
+from typing import Dict, List, Optional, Callable, Any, Union, BinaryIO, Tuple, Awaitable
+import os
 from .room import Room
 from .user import User
 from .message import Message
 from .events import Event, MessageEvent, ReactionEvent, event_factory
+from .context import CommandContext
 from .exceptions import (
     MatrixError, MatrixConnectionError, 
     MatrixAuthError, MatrixAPIError, ForbiddenError, NotFoundError,
@@ -21,22 +22,37 @@ logger = logging.getLogger(__name__)
 class Client:
     """Main client for interacting with the Matrix API."""
     
-    def __init__(self, homeserver: str, access_token: Optional[str] = None):
-        logger.debug(f"Initializing client with server: {homeserver}")
+    def __init__(self, homeserver: str, access_token: str = None, user_id: str = None, command_prefix: str = '!'):
+        """Initialize the Matrix client.
+        
+        Args:
+            homeserver: URL of the Matrix server (ex: 'https://matrix.org')
+            access_token: OAuth access token (optional)
+            user_id: User ID (optional)
+            command_prefix: Command prefix (default '!')
+        """
         self.homeserver = homeserver.rstrip('/')
         self.access_token = access_token
-        self.user_id = None
-        self.device_id = None
+        self.user_id = user_id
+        self.command_prefix = command_prefix
+        self._commands = {}
         self._session = None
         self._sync_token = None
-        self._sync_timeout = 30000  # 30 seconds
-        self._sync_task = None
-        self._should_sync = False
+        self._event_handlers = {
+            'on_ready': [],
+            'on_message': [],
+            'on_command': [],
+            'on_reaction': [],
+            'on_reaction_deleted': [],
+            'on_room_join': [],
+            'on_room_leave': [],
+        }
         self.rooms = {}  # room_id -> Room
         self.users = {}  # user_id -> User
         self._ready_handlers = []  # on_ready handlers
         self._start_time = None  # Client startup timestamp
         self._first_sync_complete = False  # Indicates if the first sync is complete
+        self._sync_task = None  # Task for the sync loop
         
         # Event handlers
         self.event_handlers = {
@@ -46,21 +62,49 @@ class Client:
             'on_room_join': [],
             'on_room_leave': [],
         }
-        logger.debug("Client initialisé avec succès")
+        logger.debug("Client initialized successfully")
     
     # ===== User Management =====
     
-    def get_user(self, user_id: str) -> 'User':
+    async def get_profile(self, user_id: str) -> dict:
+        """Get user profile information.
+        
+        Args:
+            user_id: The full user ID (ex: @user:example.com)
+            
+        Returns:
+            dict: User profile information (displayname, avatar_url, etc.)
+        """
+        try:
+            data = await self._api_request(
+                'GET',
+                f'/profile/{user_id}'
+            )
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to retrieve profile for {user_id}: {e}")
+            return {}
+    
+    async def get_user(self, user_id: str) -> 'User':
         """Get a user object by ID.
         
         Args:
             user_id: The full user ID (e.g., @user:example.com)
             
         Returns:
-            User: L'objet utilisateur correspondant
+            User: The user object corresponding to the ID
+            
+        Example:
+            user = await client.get_user("@user:example.com")
+            avatar = await user.get_avatar()
+            if avatar:
+                data = await avatar.read()
         """
         if user_id not in self.users:
-            self.users[user_id] = User(self, user_id)
+            user = User(self, user_id)
+            # Load profile asynchronously
+            await user._ensure_profile_loaded()
+            self.users[user_id] = user
         return self.users[user_id]
     
     # ===== Basic Methods =====
@@ -82,7 +126,6 @@ class Client:
         logger.debug(f"Client starting at {self._start_time} (ms since epoch)")
         
         if self.access_token:
-            # Verify the token is valid
             try:
                 whoami = await self._api_get('/_matrix/client/r0/account/whoami')
                 self.user_id = whoami.get('user_id')
@@ -90,11 +133,9 @@ class Client:
                 logger.info(f"Successfully connected as {self.user_id}")
                 logger.debug(f"Startup timestamp set to: {self._start_time}")
                 
-                # Initialize sync token to None for first sync
                 self._sync_token = None
                 logger.debug("Sync token not initialized, performing first sync...")
                 
-                # Mark that first sync is not yet complete
                 self._first_sync_complete = False
                 
             except MatrixAPIError as e:
@@ -114,18 +155,15 @@ class Client:
             password: Matrix password (optional if already connected)
         """
         try:
-            # Initialize HTTP session if it doesn't exist
             if self._session is None or self._session.closed:
                 logger.debug("Initializing HTTP session")
                 self._session = aiohttp.ClientSession()
             
-            # Login if credentials are provided
             if username and password:
                 logger.info(f"Logging in as {username}...")
                 await self.login(username, password)
                 logger.info("Successfully logged in")
             
-            # Charger d'abord les salles rejointes
             logger.info("Loading joined rooms...")
             rooms_loaded = await self._load_joined_rooms()
             
@@ -137,12 +175,10 @@ class Client:
                 if not rooms_loaded:
                     logger.error("Failed to load rooms after retry, continuing anyway...")
             
-            # Start background synchronization
             logger.info("Starting sync loop...")
             await self.start_sync()
             
-            # Wait for synchronization to be ready
-            max_attempts = 30  # 30 attempts with 0.5s interval = 15 seconds max
+            max_attempts = 30
             attempts = 0
             
             logger.info("Waiting for sync to be ready...")
@@ -157,11 +193,9 @@ class Client:
             else:
                 logger.info(f"Sync token received: {self._sync_token[:10]}...")
             
-            # Mark the first synchronization as complete
             self._first_sync_complete = True
             logger.info(f"Initial sync complete - {len(self.rooms)} rooms loaded")
             
-            # Display loaded rooms for debugging
             if self.rooms:
                 logger.info("Rooms loaded:")
                 for i, room_id in enumerate(self.rooms.keys(), 1):
@@ -183,19 +217,16 @@ class Client:
                     except Exception as e:
                         logger.error(f"Error in on_ready handler: {e}", exc_info=True)
             
-            # Keep the bot alive
             while self._should_sync:
                 await asyncio.sleep(1)
                 
-                # Periodically check the status of the synchronization task
                 if (self._sync_task and self._sync_task.done() and 
                     not self._sync_task.cancelled() and self._should_sync):
                     logger.warning("Sync task has stopped unexpectedly, restarting...")
-                    await asyncio.sleep(5)  # Small delay before restarting
+                    await asyncio.sleep(5)
                     await self.start_sync()
                 
         except asyncio.CancelledError:
-            # Clean cancellation handling
             logger.debug("Execution cancelled")
             
         except KeyboardInterrupt:
@@ -206,7 +237,6 @@ class Client:
             raise
             
         finally:
-            # Cleanup
             self._should_sync = False
             if hasattr(self, '_sync_task') and self._sync_task:
                 self._sync_task.cancel()
@@ -223,7 +253,6 @@ class Client:
     
     async def login(self, username: str, password: str, device_name: str = "MatrixLib") -> None:
         """Authenticate the user with a username and password."""
-        # Ensure the session is initialized
         if self._session is None:
             self._session = aiohttp.ClientSession()
             
@@ -238,13 +267,11 @@ class Client:
         }
         
         try:
-            # Temporarily disable authentication verification
             response = await self._api_post('/_matrix/client/r0/login', login_data, auth_required=False)
             self.access_token = response['access_token']
             self.user_id = response['user_id']
             self.device_id = response['device_id']
             
-            # Update the session with the new token
             if self._session:
                 await self._session.close()
                 
@@ -267,22 +294,17 @@ class Client:
         """Join a room by its ID or alias."""
         try:
             if room_id_or_alias.startswith('#'):
-                # It's an alias, resolve it first
                 room_id = await self._resolve_room_alias(room_id_or_alias)
             else:
                 room_id = room_id_or_alias
             
-            # Join the room
             await self._api_post(f"/_matrix/client/r0/join/{room_id}")
             
-            # Get room information
             room_info = await self._api_get(f"/_matrix/client/r0/rooms/{room_id}/state/m.room.member/{self.user_id}")
             
-            # Create the Room object
             room = Room(room_id, self, **room_info)
             self.rooms[room_id] = room
             
-            # Trigger event handlers
             await self._dispatch_event('on_room_join', room)
             
             return room
@@ -319,8 +341,6 @@ class Client:
         Returns:
             str: MXC URI of the uploaded file
         """
-        import mimetypes
-        import os
         
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -380,10 +400,8 @@ class Client:
         Returns:
             str: Event ID of the sent message
         """
-        # First upload the file
         mxc_uri = await self.upload_file(file_path, content_type, filename)
         
-        # Then send a message with the file
         msg = Message(room=self.rooms.get(room_id))
         await msg.add_attachment(
             url=mxc_uri,
@@ -391,34 +409,89 @@ class Client:
             mimetype=content_type
         )
         
-        if message:
-            msg.content = message
-            
-        return await self.send_message(room_id, msg)
     
-    async def send_message(self, room_id: str, message: Union[str, Message], **kwargs) -> str:
-        """Send a message to a room."""
-        if isinstance(message, str):
-            message = Message(message, **kwargs)
+    async def send_message(self, room_id: str, content=None, file=None, **kwargs):
+        """Send a message to a room.
         
-        # Handle file attachments
-        if hasattr(message, 'attachments') and message.attachments:
-            for attachment in message.attachments:
-                if 'file_path' in attachment and 'url' not in attachment:
-                    # Upload the file if it hasn't been uploaded yet
-                    mxc_uri = await self.upload_file(
-                        attachment['file_path'],
-                        attachment.get('mimetype'),
-                        attachment.get('filename')
-                    )
-                    attachment['url'] = mxc_uri
+        Args:
+            room_id: ID of the room to send the message to
+            content: The message content (string or dict). Can't be used with 'file'.
+            file: Path to a file to upload and send. Can't be used with 'content'.
+            **kwargs: Additional message parameters
+            
+        Returns:
+            str: The event ID of the sent message
+            
+        Raises:
+            ValueError: If both 'content' and 'file' are specified
+        """
+        if content and file:
+            raise ValueError("Simultaneous sending of text and file is not allowed. Use two separate calls.")
+        if file:
+            if not os.path.exists(file):
+                raise FileNotFoundError(f"File not found: {file}")
+                
+            mime_type = mimetypes.guess_type(file)[0] or 'application/octet-stream'
+            
+            with open(file, 'rb') as f:
+                mxc_url = await self.upload_file(
+                    file_path=file,
+                    content_type=mime_type,
+                    filename=os.path.basename(file)
+                )
+            
+            if mime_type.startswith('image/'):
+                try:
+                    from PIL import Image
+                    with Image.open(file) as img:
+                        width, height = img.size
+                except ImportError:
+                    width, height = None, None
+                
+                msg_content = {
+                    "body": os.path.basename(file),
+                    "info": {
+                        "size": os.path.getsize(file),
+                        "mimetype": mime_type,
+                    },
+                    "msgtype": "m.image",
+                    "url": mxc_url
+                }
+                
+                if width and height:
+                    msg_content["info"]["w"] = width
+                    msg_content["info"]["h"] = height
+                
+                if isinstance(content, str):
+                    msg_content["body"] = f"{content}\n{msg_content['body']}"
+                
+                content = msg_content
+            else:
+                content = {
+                    "body": content or os.path.basename(file),
+                    "filename": os.path.basename(file),
+                    "msgtype": "m.file",
+                    "url": mxc_url,
+                    "info": {
+                        "size": os.path.getsize(file),
+                        "mimetype": mime_type
+                    }
+                }
         
-        content = message.to_dict()
-        
+        if isinstance(content, str):
+            message = {
+                "msgtype": "m.text",
+                "body": content,
+                **kwargs
+            }
+        else:
+            message = content
+            message.update(kwargs)
+            
         try:
             response = await self._api_put(
                 f"/_matrix/client/r0/rooms/{room_id}/send/m.room.message/{int(time.time() * 1000)}",
-                content
+                message
             )
             return response.get('event_id')
         except MatrixAPIError as e:
@@ -476,59 +549,49 @@ class Client:
         
         while self._should_sync:
             try:
-                # Calculate backoff time with exponential backoff
-                backoff = min(2 ** retry_count, 30)  # Max 30 seconds
+                backoff = min(2 ** retry_count, 30)
                 if retry_count > 0:
                     logger.warning(f"Retry {retry_count}/{max_retries} - Waiting {backoff} seconds before next attempt...")
                     await asyncio.sleep(backoff)
                 
-                # Prepare synchronization request parameters
                 params = {
                     'timeout': str(timeout),
                     'full_state': 'false',
                     'set_presence': 'online',
                 }
                 
-                # Only include the since parameter if we have a sync token
                 if self._sync_token:
                     params['since'] = self._sync_token
                     logger.debug(f"Using sync token: {self._sync_token}")
                 else:
                     logger.debug("No sync token available, initial sync")
                 
-                # Simplified filter to get the initial sync token
                 if not self._first_sync_complete:
                     params['filter'] = json.dumps({
                         'room': {
                             'state': {},
-                            'timeline': {'limit': 1},  # Only need one event to get the sync token
+                            'timeline': {'limit': 1},
                             'ephemeral': {'limit': 0},
                         }
                     })
                 
-                # Use sync token if it exists
                 if self._sync_token:
                     params['since'] = self._sync_token
                     logger.debug(f"Synchronizing with token: {self._sync_token}")
                 else:
-                    # For the first sync, we don't specify 'since' to get the initial token
                     logger.debug("First synchronization (no token)")
                 
-                # Perform the sync request
                 logger.debug(f"Sending sync request with parameters: {params}")
                 
                 try:
                     response = await self._api_get('/_matrix/client/r0/sync', params=params)
                     
-                    # Log only a summary of the response to avoid flooding logs
                     if response:
                         logger.debug(f"Sync response received with keys: {list(response.keys())}")
                         
-                        # Log next_batch token if present
                         if 'next_batch' in response:
                             logger.debug(f"Received next_batch token: {response['next_batch']}")
                         
-                        # Log room information if available
                         if 'rooms' in response and response['rooms']:
                             rooms = response['rooms']
                             logger.debug(f"Rooms in response - joined: {len(rooms.get('join', {}))}, "
@@ -543,31 +606,26 @@ class Client:
                         return await self.sync(timeout, retry_count + 1)
                     raise
                 
-                # Update sync token for the next request
                 new_sync_token = response.get('next_batch')
                 
                 if new_sync_token:
                     logger.debug(f"Updating sync token: {new_sync_token}")
                     self._sync_token = new_sync_token
                     
-                    # Reset retry count on successful sync with token
                     retry_count = 0
                 else:
                     logger.warning("No next_batch token in sync response")
                     if retry_count < max_retries:
                         return await self.sync(timeout, retry_count + 1)
                     
-                    # If we've exhausted retries, wait a bit before trying again
                     logger.warning("Max retries reached, waiting before next attempt...")
                     await asyncio.sleep(5)
                     continue
                 
-                # Log all top-level keys in the response for debugging
                 if response:
                     logger.debug(f"Response type: {type(response)}")
                     logger.debug(f"Response keys: {list(response.keys())}")
                     
-                    # Log room information if available
                     if 'rooms' in response and response['rooms']:
                         joined_rooms = response['rooms'].get('join', {})
                         if joined_rooms:
@@ -581,7 +639,6 @@ class Client:
                 else:
                     logger.warning("Empty response received from sync endpoint")
                 
-                # Always update the sync token if we got one
                 token_updated = False
                 if new_sync_token:
                     old_token = self._sync_token
@@ -592,7 +649,6 @@ class Client:
                         self._first_sync_complete = True
                         logger.info(f"First sync completed successfully with token: {self._sync_token}")
                         
-                        # Call on_ready handlers after first sync
                         for handler in self._ready_handlers:
                             try:
                                 if asyncio.iscoroutinefunction(handler):
@@ -604,11 +660,9 @@ class Client:
                     else:
                         logger.debug(f"Sync token updated: {self._sync_token}")
                 
-                # Process the sync response if we have one
                 if response:
                     await self._handle_sync_response(response)
                 elif not self._first_sync_complete:
-                    # If no response and it's the first sync, log a warning and retry
                     logger.warning("No response received during first sync, will retry...")
                     await asyncio.sleep(1)
                     continue
@@ -623,7 +677,7 @@ class Client:
                     await asyncio.sleep(1)
                 else:
                     logger.error(f"Error during synchronization: {e}", exc_info=True)
-                    await asyncio.sleep(5)  # Wait before retrying
+                    await asyncio.sleep(5)
     
     async def _run_sync_loop(self):
         """Synchronization loop with error handling."""
@@ -639,10 +693,8 @@ class Client:
                 break
             except Exception as e:
                 logger.error(f"Error in synchronization loop: {e}", exc_info=True)
-                # Wait before retrying in case of error
                 await asyncio.sleep(5)
             
-            # Small pause to avoid a too fast loop in case of repeated errors
             if self._should_sync:
                 await asyncio.sleep(1)
     
@@ -655,23 +707,19 @@ class Client:
         logger.info("Starting synchronization loop...")
         self._should_sync = True
         
-        # Ensure the HTTP session is initialized
         if self._session is None or self._session.closed:
             logger.debug("Initializing HTTP session for sync")
             self._session = aiohttp.ClientSession()
         
-        # Create the synchronization task
         self._sync_task = asyncio.create_task(self._run_sync_loop())
         
-        # Add a callback to handle uncaught errors
         def handle_task_result(task):
             try:
-                task.result()  # This will raise an exception if the task failed
+                task.result()
             except asyncio.CancelledError:
                 logger.debug("Synchronization task was cancelled")
             except Exception as e:
                 logger.error(f"Synchronization task failed: {e}", exc_info=True)
-                # Restart synchronization after a delay
                 if self._should_sync:
                     logger.info("Restarting synchronization in 5 seconds...")
                     asyncio.get_event_loop().call_later(5, lambda: asyncio.create_task(self.start_sync()))
@@ -711,96 +759,202 @@ class Client:
         return decorator(func)
         
     def event(self, event_type: str = None):
-        """Decorator to register an event handler."""
-        def decorator(func):
-            if event_type in self.event_handlers:
-                self.event_handlers[event_type].append(func)
+        """Decorator to register an event handler.
+        
+        Can be used as:
+            @client.event
+            async def on_message(event):
+                pass
+                
+        or:
+            @client.event('custom_event')
+            async def handler(event):
+                pass
+        """
+        if callable(event_type):
+            func = event_type
+            if func.__name__.startswith('on_'):
+                event_name = func.__name__
             else:
-                self.event_handlers[event_type] = [func]
+                event_name = f"on_{func.__name__}"
+                
+            if event_name not in self.event_handlers:
+                self.event_handlers[event_name] = []
+            self.event_handlers[event_name].append(func)
+            logger.debug(f"Registered event handler for {event_name}: {func.__name__}")
             return func
+            
+        def decorator(func):
+            nonlocal event_type
+            if event_type is None:
+                if func.__name__.startswith('on_'):
+                    event_type = func.__name__
+                else:
+                    event_type = f"on_{func.__name__}"
+                    
+            if event_type not in self.event_handlers:
+                self.event_handlers[event_type] = []
+            self.event_handlers[event_type].append(func)
+            logger.debug(f"Registered event handler for {event_type}: {func.__name__}")
+            return func
+            
         return decorator
+        
+    def command(self, name: str = None, aliases: list = None, **attrs):
+        """Decorator to register a command.
+        
+        Args:
+            name: Name of the command (if different from the function name)
+            aliases: List of aliases for the command
+            **attrs: Additional attributes for the command
+            
+        Example:
+            @client.command()
+            async def ping(ctx):
+                await ctx.reply('Pong!')
+        """
+        def decorator(func):
+            nonlocal name
+            if name is None:
+                name = func.__name__
+            
+            command = {
+                'name': name,
+                'func': func,
+                'aliases': aliases or [],
+                **attrs
+            }
+            
+            self._commands[name] = command
+            if aliases:
+                for alias in aliases:
+                    self._commands[alias] = command
+                    
+            return func
+            
+        return decorator
+        
+    async def _process_commands(self, event):
+        """Process incoming messages to check for commands."""
+        if event.sender == self.user_id:
+            return
+            
+        if not hasattr(event, 'content') or 'body' not in event.content:
+            return
+            
+        content = event.content['body']
+        if not content.startswith(self.command_prefix):
+            return
+            
+        args = content[len(self.command_prefix):].split()
+        if not args:
+            return
+            
+        command_name = args[0].lower()
+        command = self._commands.get(command_name)
+        
+        if not command:
+            for cmd in self._commands.values():
+                if command_name in cmd.get('aliases', []):
+                    command = cmd
+                    break
+                    
+        if command:
+            ctx = CommandContext(self, event, command_name, args[1:], command)
+            
+            try:
+                await command['func'](ctx)
+                for handler in self._event_handlers.get('on_command', []):
+                    await handler(event, command_name, args[1:])
+            except Exception as e:
+                logger.error(f"Error executing command {command_name}: {e}", exc_info=True)
+                try:
+                    await ctx.reply(f"❌ Une erreur est survenue: {str(e)}")
+                except:
+                    pass
     
     async def _dispatch_event(self, event_type: str, *args, **kwargs):
         """Triggers event handlers for a given event type."""
+        logger.debug(f"Dispatching event: {event_type}")
+        logger.debug(f"Event handlers: {self.event_handlers}")
         if event_type in self.event_handlers:
-            for handler in self.event_handlers[event_type]:
+            logger.debug(f"Found {len(self.event_handlers[event_type])} handlers for {event_type}")
+            for i, handler in enumerate(self.event_handlers[event_type]):
                 try:
+                    logger.debug(f"Calling handler {i} for {event_type}: {handler}")
                     if asyncio.iscoroutinefunction(handler):
                         await handler(*args, **kwargs)
                     else:
                         handler(*args, **kwargs)
                 except Exception as e:
-                    logger.error(f"Error in {event_type} event handler: {e}")
+                    logger.error(f"Error in {event_type} event handler: {e}", exc_info=True)
+        else:
+            logger.warning(f"No handlers registered for event type: {event_type}")
     
     # ===== Internal Methods =====
     
     async def _load_joined_rooms(self) -> bool:
         """
-        Charge toutes les salles rejointes via l'API.
+        Load all joined rooms via the API.
         
         Returns:
-            bool: True si le chargement a réussi, False sinon
+            bool: True if the loading was successful, False otherwise
         """
         try:
             if not hasattr(self, '_session') or self._session is None:
-                logger.error("Session non initialisée")
+                logger.error("Session not initialized")
                 return False
                 
             if not hasattr(self, 'access_token') or not self.access_token:
-                logger.error("Token d'accès non disponible")
+                logger.error("Access token not available")
                 return False
                 
-            logger.debug("Récupération des salles rejointes via l'API...")
+            logger.debug("Loading joined rooms via API...")
             
-            # Utiliser directement _api_get avec le bon endpoint
             response = await self._api_get("/_matrix/client/r0/joined_rooms")
             
             if not response or 'joined_rooms' not in response:
-                logger.error(f"Réponse inattendue de l'API: {response}")
+                logger.error(f"Unexpected API response: {response}")
                 return False
                 
             room_ids = response['joined_rooms']
-            logger.debug(f"{len(room_ids)} salles rejointes récupérées")
+            logger.debug(f"{len(room_ids)} rooms loaded")
             
             rooms_loaded = 0
             for room_id in room_ids:
                 try:
                     if room_id not in self.rooms:
                         self.rooms[room_id] = Room(room_id, self)
-                        logger.debug(f"Nouvelle salle chargée: {room_id}")
+                        logger.debug(f"New room loaded: {room_id}")
                         rooms_loaded += 1
                 except Exception as room_error:
-                    logger.error(f"Erreur lors du chargement de la salle {room_id}: {room_error}")
+                    logger.error(f"Error loading room {room_id}: {room_error}")
             
-            logger.info(f"Chargement terminé - {rooms_loaded} nouvelles salles chargées (total: {len(self.rooms)})")
+            logger.info(f"Loading completed - {rooms_loaded} new rooms loaded (total: {len(self.rooms)})")
             return True
             
         except Exception as e:
-            logger.error(f"Erreur lors du chargement des salles: {e}", exc_info=True)
+            logger.error(f"Error loading rooms: {e}", exc_info=True)
             return False
 
     async def _handle_sync_response(self, response: Dict[str, Any]) -> None:
         """Processes the synchronization response and triggers the appropriate events."""
-        # Update the synchronization token if present
         if 'next_batch' in response and response['next_batch']:
             self._sync_token = response['next_batch']
             logger.debug(f"Updated synchronization token: {self._sync_token}")
         else:
-            logger.warning("Aucun token de synchronisation reçu dans la réponse")
+            logger.warning("No synchronization token received in the response")
         
-        # Traitement des salles
         rooms = response.get('rooms', {})
         logger.debug(f"Received sync response with {len(rooms.get('join', {}))} joined rooms, "
                     f"{len(rooms.get('invite', {}))} invites, {len(rooms.get('leave', {}))} left rooms")
         
-        # If this is the first synchronization, load all joined rooms
         if not hasattr(self, '_first_sync_complete') or not self._first_sync_complete:
             logger.debug("First synchronization - Starting...")
             await self._load_joined_rooms()
             self._first_sync_complete = True
             logger.info(f"First synchronization complete - {len(self.rooms)} rooms loaded")
             
-            # Call on_ready handlers after first synchronization
             for handler in self._ready_handlers:
                 try:
                     if asyncio.iscoroutinefunction(handler):
@@ -808,27 +962,22 @@ class Client:
                     else:
                         handler()
                 except Exception as e:
-                    logger.error(f"Erreur dans le gestionnaire on_ready: {e}", exc_info=True)
+                    logger.error(f"Error in on_ready handler: {e}", exc_info=True)
         
-        # Gestion des salles rejointes
         for room_id, room_data in rooms.get('join', {}).items():
             if room_id not in self.rooms:
                 self.rooms[room_id] = Room(room_id, self)
-                logger.info(f"Nouvelle salle détectée: {room_id}")
+                logger.info(f"New room detected: {room_id}")
             await self._handle_room_events(room_id, room_data)
         
-        # Gestion des invitations
         for room_id, room_data in rooms.get('invite', {}).items():
             if room_id not in self.rooms:
                 self.rooms[room_id] = Room(room_id, self)
                 logger.info(f"New invitation to room: {room_id}")
-            # Trigger an invitation event
             await self._dispatch_event('on_room_invite', self.rooms[room_id])
         
-        # Handle left rooms
         for room_id, room_data in rooms.get('leave', {}).items():
             if room_id in self.rooms:
-                # Trigger a leave event before removing the room
                 await self._dispatch_event('on_room_leave', self.rooms[room_id])
                 del self.rooms[room_id]
                 logger.info(f"Left room: {room_id}")
@@ -840,28 +989,23 @@ class Client:
                 logger.warning("Received empty room_id in _handle_room_events")
                 return
                 
-            # Retrieve or create the room
             if room_id not in self.rooms:
                 logger.debug(f"Creating new room: {room_id}")
                 self.rooms[room_id] = Room(room_id, self)
             
             room = self.rooms[room_id]
             
-            # Ensure the room ID is properly set
             if not hasattr(room, 'id') or not room.id:
                 room.id = room_id
                 logger.debug(f"Set room ID to: {room_id}")
             
-            # Check that _start_time is defined
             if not hasattr(self, '_start_time') or self._start_time is None:
                 self._start_time = int(time.time() * 1000)
                 logger.debug(f"_start_time set to: {self._start_time}")
             
-            # Process timeline events
             timeline_events = room_data.get('timeline', {}).get('events', [])
             logger.debug(f"Processing {len(timeline_events)} events in room {room_id}")
             
-            # If no events, we can stop here
             if not timeline_events:
                 logger.debug(f"No events to process for room {room_id}")
                 return
@@ -875,18 +1019,15 @@ class Client:
             event_type = event_data.get('type', 'unknown')
             event_ts = event_data.get('origin_server_ts', 0)
             
-            # Ignore events without a timestamp
             if not event_ts:
-                logger.debug(f"Événement {event_id} ignoré: pas de timestamp")
+                logger.debug(f"Event {event_id} ignored: no timestamp")
                 continue
             
-            # For redaction events, we create a special ReactionEvent
             if event_type == 'm.room.redaction':
                 redacts_event_id = event_data.get('redacts')
                 if redacts_event_id:
                     logger.debug(f"Handling redaction event for ID: {redacts_event_id}")
                     
-                    # Retrieve the original event from the room if possible
                     original_event = None
                     if hasattr(room, 'get_event'):
                         try:
@@ -894,16 +1035,13 @@ class Client:
                         except Exception as e:
                             logger.warning(f"Unable to retrieve original event {redacts_event_id}: {e}")
                     
-                    # Prepare the base event content
                     event_content = {}
                     relates_to = {}
                     
-                    # If we have the original event, extract its information
                     if original_event:
                         event_content = getattr(original_event, 'content', {})
                         relates_to = getattr(original_event, 'relates_to', {})
                     
-                    # Create a special reaction event for the redaction
                     event_data = {
                         'type': 'm.reaction',
                         'event_id': event_data.get('event_id'),
@@ -912,18 +1050,17 @@ class Client:
                         'content': event_content,
                         'm.relates_to': relates_to,
                         'unsigned': {
-                            'redacted_because': event_data,  # Keep the original redaction event
+                            'redacted_because': event_data,
                             'original_event': original_event.raw_data if original_event else None,
                             'redaction_event': True
                         },
                         'redacts': redacts_event_id
                     }
                     
-                    # Ensure the 'key' is present in relates_to if it exists in the content
                     if 'key' in event_content and 'key' not in relates_to:
                         event_data['m.relates_to']['key'] = event_content['key']
                     
-                    event_type = 'm.reaction'  # Treat as a reaction event
+                    event_type = 'm.reaction'
                     
                     logger.debug(f"Creating a reaction redaction event for ID: {redacts_event_id}")
                     logger.debug(f"Redaction event details: {json.dumps({
@@ -936,28 +1073,22 @@ class Client:
                         'relates_to': event_data.get('m.relates_to', {})
                     }, indent=2, default=str)}")
             
-            # Ignore events that are not messages or reactions
             if event_type not in ['m.room.message', 'm.reaction']:
                 logger.debug(f"Event not handled of type {event_type}: {event_id}")
                 continue
             
-            # Get current time for comparison
             current_time = int(time.time() * 1000)
             
-            # Ignore messages that are too old (more than 5 seconds before startup)
             if event_ts < self._start_time - 5000:
                 logger.debug(f"Message {event_id} ignored: too old (startup: {self._start_time}, message: {event_ts})")
                 continue
             
-            # Ignore messages in the future (more than 5 seconds)
             if event_ts > (current_time + 5000):
                 logger.debug(f"Message {event_id} ignored: in the future (current: {current_time}, message: {event_ts})")
                 continue
             
-            # Log message details
             logger.debug(f"Handling message {event_id} (ts: {event_ts}): {event_data.get('content', {}).get('body', '')}")
             
-            # Process the message
             await self._handle_event(room, event_data)
     
     async def _handle_event(self, room: Room, event_data: Dict[str, Any]) -> None:
@@ -974,24 +1105,25 @@ class Client:
                 else:
                     logger.warning(f"Missing room_id in event: {event_id}")
             
-            # Create the event with the updated room
             event = event_factory(event_data, room)
             
-            # Add the event to the room's cache
             if hasattr(room, 'add_event'):
                 room.add_event(event)
             
-            # Event type specific processing
             if isinstance(event, MessageEvent):
                 room_id = getattr(room, 'id', 'unknown')
                 logger.debug(f"Dispatching message event: {event_id} (type: {event.type}, room: {room_id})")
                 logger.debug(f"Message content: {getattr(event, 'content', 'No content')}")
                 
-                # Check if the event has a valid sender and content
                 if not hasattr(event, 'sender') or not hasattr(event, 'content'):
                     logger.warning(f"Message event {event_id} is missing sender or content")
                     return
-                    
+                
+                if hasattr(event, 'content') and 'body' in event.content:
+                    content = event.content['body']
+                    if content.startswith(self.command_prefix):
+                        await self._process_commands(event)
+                
                 await self._dispatch_event('on_message', event)
                 
             elif isinstance(event, ReactionEvent):
@@ -1024,29 +1156,49 @@ class Client:
     
     # ===== HTTP API Methods =====
     
-    async def _api_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
-        """Makes an HTTP request to the Matrix API."""
-        # Remove custom parameters that are not HTTP request parameters
+    async def _api_request(self, method: str, endpoint: str, **kwargs) -> Union[Dict[str, Any], bytes]:
+        """Makes an HTTP request to the Matrix API.
+        
+        Args:
+            method: HTTP method (GET, POST, PUT, etc.)
+            endpoint: API endpoint (e.g., '/sync' or full URL)
+            **kwargs: Additional arguments passed to aiohttp.request
+            
+        Keyword Args:
+            auth_required: If True (default), adds the access token to headers
+            binary: If True, returns raw bytes instead of parsing JSON
+            
+        Returns:
+            Union[Dict[str, Any], bytes]: Parsed JSON response or raw bytes if binary=True
+        """
         auth_required = kwargs.pop('auth_required', True)
+        binary = kwargs.pop('binary', False)
         
         if endpoint.startswith('http'):
             url = endpoint
         else:
-            # Remove the API prefix if already present to avoid duplication
-            if endpoint.startswith('/_matrix/client/r0'):
-                endpoint = endpoint[len('/_matrix/client/r0'):]
-            elif not endpoint.startswith('/'):
-                endpoint = '/' + endpoint
-            
-            # Build the complete URL
-            base_url = self.homeserver.rstrip('/')
-            url = f"{base_url}/_matrix/client/r0{endpoint}"
+            if (endpoint.startswith('_matrix/media/') and 
+                self.homeserver == 'https://matrix.org' and 
+                not endpoint.startswith('_matrix/media/r0/download/')):
+                base_url = 'https://matrix-client.matrix.org'
+                endpoint = endpoint.lstrip('/')
+                url = f"{base_url}/{endpoint}"
+            else:
+                if endpoint.startswith('/_matrix/client/r0'):
+                    endpoint = endpoint[len('/_matrix/client/r0'):]
+                elif not endpoint.startswith('/'):
+                    endpoint = '/' + endpoint
+                
+                base_url = self.homeserver.rstrip('/')
+                url = f"{base_url}/_matrix/client/r0{endpoint}"
         
         headers = kwargs.pop('headers', {})
         if auth_required and self.access_token and 'Authorization' not in headers:
             headers['Authorization'] = f'Bearer {self.access_token}'
         
-        # Log request details
+        if 'User-Agent' not in headers:
+            headers['User-Agent'] = 'matryx/1.0'
+        
         request_id = str(id(self))
         logger.debug(f"[{request_id}] Sending {method} request to {url}")
         logger.debug(f"[{request_id}] Headers: {headers}")
@@ -1060,13 +1212,21 @@ class Client:
                 headers=headers,
                 **kwargs
             ) as response:
-                # Try to read the response as JSON
+                if binary:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        logger.error(f"[{request_id}] Error {response.status}: {error_text}")
+                        raise MatrixAPIError(
+                            f"Error {response.status}: {error_text}",
+                            status_code=response.status
+                        )
+                    return await response.read()
+                
                 try:
                     data = await response.json()
                     logger.debug(f"[{request_id}] Response received: {response.status} {response.reason}")
                     logger.debug(f"[{request_id}] Data: {json.dumps(data, indent=2)[:500]}...")  # Limit log size
                 except Exception as e:
-                    # In case of JSON read error, read raw text
                     text = await response.text()
                     logger.error(f"[{request_id}] JSON read error: {e}")
                     logger.error(f"[{request_id}] Raw response: {text[:1000]}")
@@ -1108,7 +1268,6 @@ class Client:
     
     async def _api_get(self, endpoint: str, **kwargs) -> Dict[str, Any]:
         """Performs a GET request to the Matrix API."""
-        # Add debug logging for the request
         logger.debug(f"Making GET request to {endpoint}")
         logger.debug(f"Request parameters: {kwargs.get('params', {})}")
         
@@ -1118,7 +1277,6 @@ class Client:
             return response
         except Exception as e:
             logger.error(f"Error in GET request to {endpoint}: {str(e)}")
-            # Log additional debug info if available
             if hasattr(e, 'response') and hasattr(e.response, 'status'):
                 logger.error(f"Response status: {e.response.status}")
                 try:

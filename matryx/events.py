@@ -7,7 +7,6 @@ from .user import User
 from .asset import MatrixAsset
 import os
 
-# Configuration du logger
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -27,7 +26,6 @@ class Event:
         self.type = event_data.get('type')
         self.content = event_data.get('content', {})
         
-        # Ensure room_id is available as an attribute for backward compatibility
         if hasattr(room, 'id'):
             self.room_id = room.id
         elif 'room_id' in event_data:
@@ -35,7 +33,6 @@ class Event:
         else:
             self.room_id = None
         
-        # Convert timestamp to datetime object
         self._timestamp = None
         if self.origin_server_ts is not None:
             self._timestamp = datetime.fromtimestamp(self.origin_server_ts / 1000, tz=timezone.utc)
@@ -63,7 +60,6 @@ class Event:
             tz = pytz.timezone(timezone_str)
             return self._timestamp.astimezone(tz).strftime(format_str)
         except ImportError:
-            # Fallback if pytz is not installed
             return self._timestamp.strftime(format_str)
     
     def __str__(self) -> str:
@@ -77,10 +73,8 @@ class MessageEvent(Event):
         super().__init__(event_data, room)
         content = event_data.get('content', {})
         
-        # Vérifier s'il s'agit d'un message avec pièce jointe
         attachments = []
         if 'url' in content and content.get('msgtype') in ['m.image', 'm.file', 'm.video', 'm.audio']:
-            # C'est un message avec pièce jointe
             attachment = {
                 'url': content['url'],
                 'filename': content.get('filename'),
@@ -92,7 +86,6 @@ class MessageEvent(Event):
             }
             attachments.append(attachment)
         
-        # Créer une copie du contenu sans les champs déjà gérés
         extra_content = content.copy()
         for field in ['body', 'msgtype', 'url', 'filename', 'info']:
             extra_content.pop(field, None)
@@ -107,10 +100,8 @@ class MessageEvent(Event):
             **extra_content
         )
         
-        # Ajouter l'URL MXC comme attribut pour un accès facile
         if 'url' in content and content['url'].startswith('mxc://'):
             self.media_url = content['url']
-            # Utiliser le client de la room pour créer l'asset
             self.asset = MatrixAsset(room.client if room and hasattr(room, 'client') else None, self.media_url)
         else:
             self.media_url = None
@@ -141,12 +132,10 @@ class MessageEvent(Event):
                 if self.message.attachments and self.message.attachments[0].get('filename'):
                     output_path = self.message.attachments[0]['filename']
                 else:
-                    # Générer un nom de fichier basé sur l'URL MXC
                     media_id = self.media_url.split('/')[-1]
                     ext = self.message.attachments[0].get('mimetype', '').split('/')[-1] if self.message.attachments else 'bin'
                     output_path = f"{media_id[:8]}.{ext}"
             
-            # Créer le répertoire parent si nécessaire
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             
             with open(output_path, 'wb') as f:
@@ -171,48 +160,37 @@ class ReactionEvent(Event):
     def __init__(self, event_data: Dict[str, Any], room: 'Room' = None):
         super().__init__(event_data, room)
         
-        # Initialize attributes with default values
         self._is_redaction = False
         self.relates_to = {}
         self.reaction_key = None
         self.event_id = None
         self.original_event_id = None
         
-        # For redaction events, we extract information differently
         if self.type == 'm.room.redaction' or 'redacts' in event_data:
             self._is_redaction = True
             
-            # The ID of the reaction event being deleted
             self.original_event_id = event_data.get('redacts')
             self.event_id = event_data.get('event_id')
             
-            # Try to retrieve reaction information from different sources
-            # 1. From redacted_because (if the event was redacted)
             redacted_because = self.unsigned.get('redacted_because', {})
             
-            # 2. From the content of the original reaction event
             if 'content' in redacted_because:
                 content = redacted_because['content']
                 if 'm.relates_to' in content:
                     self.relates_to = content['m.relates_to']
                 
-                # Try to retrieve the reaction key from the original event content
                 if 'key' in content and not self.relates_to:
                     self.relates_to = {'key': content['key']}
             
-            # 3. Check if relates_to is directly in the event
             if not self.relates_to and 'm.relates_to' in event_data:
                 self.relates_to = event_data['m.relates_to']
             
-            # 4. Extract the reaction key
             if isinstance(self.relates_to, dict):
                 self.reaction_key = self.relates_to.get('key')
             
-            # 5. If we still don't have a key, try to retrieve it from the content
             if not self.reaction_key and 'key' in self.content:
                 self.reaction_key = self.content['key']
-                
-            # 6. If we have an original_event in the unsigned data, use it
+            
             original_event_data = self.unsigned.get('original_event')
             if not self.reaction_key and original_event_data:
                 if 'content' in original_event_data and 'm.relates_to' in original_event_data['content']:
@@ -224,16 +202,13 @@ class ReactionEvent(Event):
             
             logger.debug(f"Details of deleted reaction - relates_to: {self.relates_to}, reaction_key: {self.reaction_key}")
         else:
-            # Normal behavior for a standard reaction
             self.relates_to = self.content.get('m.relates_to', {})
             if isinstance(self.relates_to, dict):
                 self.reaction_key = self.relates_to.get('key')
                 self.original_event_id = self.relates_to.get('event_id')
             
-            # For normal reactions, event_id is the reaction event ID
             self.event_id = event_data.get('event_id')
         
-        # Debug logging
         logger.debug(f"New ReactionEvent: type={self.type}, "
                    f"is_removal={self.is_removal}, "
                    f"reaction_key={self.reaction_key}, "

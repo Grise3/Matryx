@@ -28,14 +28,12 @@ class Message:
         self.extra_data = kwargs
         self.attachments: List[Dict[str, Any]] = kwargs.get('attachments', [])
         
-        # Pour les réponses
         self.in_reply_to = kwargs.get('in_reply_to')
         self.thread_id = kwargs.get('thread_id')
         
-        # Si on a des pièces jointes mais pas de contenu, on crée un contenu par défaut
         if self.attachments and not self.content:
-            self.content = "Pièce jointe: " + ", ".join(
-                a.get('filename', 'fichier') for a in self.attachments
+            self.content = "Attachment: " + ", ".join(
+                a.get('filename', 'file') for a in self.attachments
             )
     
     def __str__(self) -> str:
@@ -64,16 +62,16 @@ class Message:
         height: Optional[int] = None
     ) -> None:
         """
-        Ajoute une pièce jointe au message.
+        Add an attachment to the message.
         
         Args:
-            file_path: Chemin local vers le fichier à joindre
-            url: URL MXC du fichier (si déjà uploadé)
-            filename: Nom du fichier
-            mimetype: Type MIME du fichier
-            size: Taille du fichier en octets
-            width: Largeur (pour les images)
-            height: Hauteur (pour les images)
+            file_path: Local file path to attach
+            url: MXC URL of the file (if already uploaded)
+            filename: File name
+            mimetype: MIME type of the file
+            size: File size in bytes
+            width: Image width (for images)
+            height: Image height (for images)
         """
         if file_path:
             if not os.path.isfile(file_path):
@@ -105,7 +103,6 @@ class Message:
                 'height': height
             })
             
-        # Déterminer le type de message en fonction du MIME type
         if mimetype and mimetype.startswith('image/'):
             attachment['msgtype'] = 'm.image'
         elif mimetype and mimetype.startswith('video/'):
@@ -117,9 +114,8 @@ class Message:
             
         self.attachments.append(attachment)
         
-        # Mettre à jour le contenu du message si nécessaire
         if not self.content:
-            self.content = f"Pièce jointe: {filename}"
+            self.content = f"Attachment: {filename}"
     
     async def add_reaction(self, emoji: str) -> None:
         """Add a reaction to this message."""
@@ -131,9 +127,7 @@ class Message:
     def to_dict(self) -> Dict[str, Any]:
         """Convert the message to a dictionary compatible with the Matrix API."""
         if self.attachments:
-            # Si on a des pièces jointes, on envoie un message avec pièce jointe
             if len(self.attachments) == 1:
-                # Un seul fichier
                 attachment = self.attachments[0]
                 data = {
                     'msgtype': attachment.get('msgtype', 'm.file'),
@@ -146,19 +140,16 @@ class Message:
                     }
                 }
                 
-                # Ajout des dimensions pour les images
                 if attachment.get('width') and attachment.get('height'):
                     data['info'].update({
                         'w': attachment['width'],
                         'h': attachment['height']
                     })
                 
-                # Ajout du contenu en texte clair si disponible
                 if self.content:
                     data['body'] = self.content
                     data['filename'] = attachment.get('filename')
             else:
-                # Plusieurs fichiers, on envoie un message texte avec les liens
                 file_list = "\n".join(
                     f"- {a.get('filename')} ({a.get('size', 0) // 1024} KB)" 
                     for a in self.attachments
@@ -168,14 +159,12 @@ class Message:
                     'body': f"{self.content}\n\nFichiers joints :\n{file_list}"
                 }
         else:
-            # Message texte simple
             data = {
                 'msgtype': self.msgtype,
                 'body': self.content,
                 **self.extra_data
             }
         
-        # Gestion des réponses
         if self.in_reply_to:
             if 'm.relates_to' not in data:
                 data['m.relates_to'] = {}

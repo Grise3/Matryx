@@ -18,14 +18,14 @@ class Room:
         self.topic = kwargs.get('topic')
         self.aliases = kwargs.get('aliases', [])
         self.canonical_alias = kwargs.get('canonical_alias')
-        self.members = {}  # user_id -> User
+        self.members = {}
         self._typing_users = set()
         self._typing_task = None
-        self._events = {}  # Cache of events by ID
+        self._events = {}
     
     @property
     def client(self):
-        """Retourne le client associé à cette salle."""
+        """Return the client associated with this room."""
         return self._client
         
     def __str__(self) -> str:
@@ -119,7 +119,6 @@ class Room:
             
         await self._client.send_typing(self.id, True, timeout * 1000)
         
-        # Schedule the stop of the typing indication
         self._typing_task = asyncio.create_task(self._stop_typing_after(timeout))
     
     async def _stop_typing_after(self, delay: float) -> None:
@@ -128,7 +127,6 @@ class Room:
             await asyncio.sleep(delay)
             await self._client.send_typing(self.id, False)
         except asyncio.CancelledError:
-            # The task was cancelled because the user started typing again
             pass
         finally:
             self._typing_task = None
