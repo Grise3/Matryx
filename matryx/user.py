@@ -28,7 +28,7 @@ class User:
         return hash(self.id)
     
     @property
-    async def avatar_url(self) -> Optional[str]:
+    def avatar_url(self) -> Optional[str]:
         """Returns the URL of the user's avatar, or None if they have no avatar.
         
         Returns:
@@ -36,41 +36,50 @@ class User:
             
         Example:
             # Get avatar URL
-            url = await user.avatar_url
+            url = user.avatar_url
             if url:
                 print(f"Avatar URL: {url}")
         """
-        await self._ensure_profile_loaded()
-        return self.get_avatar_url()
+        if not self._profile_loaded:
+            # Charge le profil en arrière-plan
+            asyncio.create_task(self._ensure_profile_loaded())
+        return self._avatar_url
         
 
         
     def get_avatar_url(self, width: int = 128, height: int = 128) -> Optional[str]:
         """Returns the HTTPS URL for the user's avatar with optional resizing.
-        
+
         Args:
             width: Width of the thumbnail in pixels
             height: Height of the thumbnail in pixels
-            
+
         Returns:
             Optional[str]: The HTTPS URL of the avatar or None if not set
+            
+        Example:
+            # Get avatar URL with default size (128x128)
+            url = user.avatar_url
+            
+            # Get avatar URL with custom size
+            large_avatar = user.get_avatar_url(width=256, height=256)
         """
         if not self._avatar_url:
             return None
-            
+
         if self._avatar_url.startswith('http'):
             return self._avatar_url
-            
+
         if self._avatar_url.startswith('mxc://'):
             mxc_parts = self._avatar_url.replace('mxc://', '').split('/', 1)
             if len(mxc_parts) == 2:
                 server_name = mxc_parts[0]
                 media_id = mxc_parts[1]
                 media_id = media_id.replace('/', '%2F')
+
                 return (
-                    f"https://matrix-client.matrix.org/_matrix/media/v3/thumbnail/"
-                    f"{server_name}/{media_id}?width={width}&height={height}"
-                    "&method=crop&allow_redirect=true"
+                    f"https://matrix.org/_matrix/client/v1/media/download/"
+                    f"{server_name}/{media_id}?access_token={self._client.access_token}"
                 )
         return self._avatar_url
         
@@ -89,25 +98,39 @@ class User:
         from .asset import MatrixAsset
         return MatrixAsset(self._avatar_url, self._client)
     
-    async def _ensure_profile_loaded(self):
+    async def _ensure_profile_loaded(self) -> None:
         """S'assure que le profil utilisateur est chargé."""
-        if not self._profile_loaded:
-            try:
-                profile = await self._client.get_profile(self.id)
-                if profile:
-                    self._display_name = profile.get('displayname')
-                    self._avatar_url = profile.get('avatar_url')
-                self._profile_loaded = True
-            except Exception as e:
-                logger.warning(f"Erreur lors du chargement du profil de {self.id}: {e}")
+        if self._profile_loaded:
+            return
+            
+        try:
+            profile = await self._client.get_profile(self.id)
+            if profile:
+                self._display_name = profile.get('displayname')
+                self._avatar_url = profile.get('avatar_url')
+        except Exception as e:
+            logger.warning(f"Erreur lors du chargement du profil de {self.id}: {e}")
+        finally:
+            # On marque le profil comme chargé même en cas d'erreur
+            # pour éviter de réessayer indéfiniment
+            self._profile_loaded = True
     
+    @property
+    def display_name(self) -> str:
+        """Get the user's display name.
+        
+        Returns:
+            str: The user's display name or username if not set
+        """
+        if not self._profile_loaded:
+            # Charge le profil en arrière-plan
+            asyncio.create_task(self._ensure_profile_loaded())
+        return self._display_name or self.id.split(':')[0].lstrip('@')
+        
+    # Alias pour rétrocompatibilité
     async def displayname(self) -> str:
-        """Get the display name of the user."""
-        if self._display_name is None:
-            await self._ensure_profile_loaded()
-            if self._display_name is None:
-                return self.id.split(':', 1)[0].lstrip('@')
-        return self._display_name
+        """Alias for display_name for backward compatibility."""
+        return self.display_name
         
     async def get_avatar(self) -> Optional['MatrixAsset']:
         """Récupère l'avatar de l'utilisateur de manière asynchrone."""

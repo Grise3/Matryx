@@ -19,12 +19,13 @@ class Event:
     def __init__(self, event_data: Dict[str, Any], room: 'Room' = None):
         self.raw_data = event_data
         self.event_id = event_data.get('event_id')
-        self.sender = event_data.get('sender')
+        self._sender_id = event_data.get('sender')
         self.origin_server_ts = event_data.get('origin_server_ts')
         self.unsigned = event_data.get('unsigned', {})
         self.room = room
         self.type = event_data.get('type')
         self.content = event_data.get('content', {})
+        self._sender = None
         
         if hasattr(room, 'id'):
             self.room_id = room.id
@@ -65,6 +66,21 @@ class Event:
     def __str__(self) -> str:
         timestamp = self.format_timestamp() if hasattr(self, 'format_timestamp') else 'no-timestamp'
         return f"<{self.__class__.__name__} id={self.event_id} type={self.type} ts={timestamp}>"
+    
+    @property
+    def sender_id(self) -> str:
+        """Retourne l'ID de l'expéditeur (sans faire d'appel réseau)."""
+        return self._sender_id
+    
+    @property
+    def sender(self) -> 'User':
+        """
+        Return the User object of the sender.
+        """
+        if self._sender is None and hasattr(self, 'room') and self.room and hasattr(self.room, 'client'):
+            self._sender = self.room.client._get_user(self._sender_id)
+            asyncio.create_task(self._sender._ensure_profile_loaded())
+        return self._sender
 
 class MessageEvent(Event):
     """Represents a message event in Matrix."""

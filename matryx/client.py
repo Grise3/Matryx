@@ -47,14 +47,14 @@ class Client:
             'on_room_join': [],
             'on_room_leave': [],
         }
-        self.rooms = {}  # room_id -> Room
-        self.users = {}  # user_id -> User
-        self._ready_handlers = []  # on_ready handlers
-        self._start_time = None  # Client startup timestamp
-        self._first_sync_complete = False  # Indicates if the first sync is complete
-        self._sync_task = None  # Task for the sync loop
+        self.rooms = {}
+        self.users = {}
+        self._ready_handlers = []
+        self._start_time = None
+        self._first_sync_complete = False
+        self._sync_task = None
+        self._user_cache = {}
         
-        # Event handlers
         self.event_handlers = {
             'on_message': [],
             'on_reaction': [],
@@ -85,27 +85,60 @@ class Client:
             logger.warning(f"Failed to retrieve profile for {user_id}: {e}")
             return {}
     
-    async def get_user(self, user_id: str) -> 'User':
-        """Get a user object by ID.
+    def _get_user(self, user_id: str) -> 'User':
+        """Get a user by their ID without making a network request.
+        
+        This is an internal method. Use get_user() instead unless you know what you're doing.
         
         Args:
-            user_id: The full user ID (e.g., @user:example.com)
+            user_id: The Matrix user ID (e.g., @user:example.com)
             
         Returns:
-            User: The user object corresponding to the ID
+            User: An unloaded User object
+        """
+        if not user_id:
+            raise ValueError("user_id cannot be None or empty")
+            
+        if user_id not in self._user_cache:
+            self._user_cache[user_id] = User(self, user_id)
+            
+        return self._user_cache[user_id]
+        
+    async def get_user(self, user_id: str) -> 'User':
+        """
+        Get a user by their ID.
+        
+        Args:
+            user_id: The Matrix user ID (e.g., @user:example.com)
+            
+        Returns:
+            User: The User object for the given ID
             
         Example:
             user = await client.get_user("@user:example.com")
-            avatar = await user.get_avatar()
-            if avatar:
-                data = await avatar.read()
+            print(f"User display name: {user.display_name}")
+            
+            # Get user's avatar URL
+            avatar_url = user.avatar_url
+            if avatar_url:
+                print(f"Avatar URL: {avatar_url}")
         """
-        if user_id not in self.users:
-            user = User(self, user_id)
-            # Load profile asynchronously
-            await user._ensure_profile_loaded()
-            self.users[user_id] = user
-        return self.users[user_id]
+        user = self._get_user(user_id)
+        asyncio.create_task(user._ensure_profile_loaded())
+        return user
+    
+    @property
+    def is_logged_in(self) -> bool:
+        """Vérifie si le client est connecté en vérifiant le token d'accès.
+        
+        Returns:
+            bool: True si connecté, False sinon
+            
+        Example:
+            if client.is_logged_in:
+                print("✅ Connecté à Matrix")
+        """
+        return bool(self.access_token and self._session is not None)
     
     # ===== Basic Methods =====
     
