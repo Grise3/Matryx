@@ -1095,8 +1095,8 @@ class Client:
                     
                     event_type = 'm.reaction'
                     
-                    logger.debug(f"Creating a reaction redaction event for ID: {redacts_event_id}")
-                    logger.debug(f"Redaction event details: {json.dumps({
+                    logger.debug("Creating a reaction redaction event for ID: %s", redacts_event_id)
+                    logger.debug("Redaction event details: %s", json.dumps({
                         'type': 'm.reaction',
                         'event_id': event_data.get('event_id'),
                         'sender': event_data.get('sender'),
@@ -1104,7 +1104,7 @@ class Client:
                         'has_original_event': original_event is not None,
                         'content_keys': list(event_data.get('content', {}).keys()),
                         'relates_to': event_data.get('m.relates_to', {})
-                    }, indent=2, default=str)}")
+                    }, indent=2, default=str))
             
             if event_type not in ['m.room.message', 'm.reaction']:
                 logger.debug(f"Event not handled of type {event_type}: {event_id}")
